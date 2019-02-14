@@ -25,6 +25,8 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 
+	cligoinformersv1 "github.com/openshift/client-go/config/informers/externalversions/config/v1"
+	cligolistersv1 "github.com/openshift/client-go/config/listers/config/v1"
 	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
 	mtmpl "github.com/openshift/machine-config-operator/pkg/controller/template"
@@ -66,6 +68,9 @@ type Controller struct {
 	mccrLister       mcfglistersv1.ContainerRuntimeConfigLister
 	mccrListerSynced cache.InformerSynced
 
+	imgLister       cligolistersv1.ImageLister
+	imgListerSynced cache.InformerSynced
+
 	mcpLister       mcfglistersv1.MachineConfigPoolLister
 	mcpListerSynced cache.InformerSynced
 
@@ -78,6 +83,7 @@ func New(
 	mcpInformer mcfginformersv1.MachineConfigPoolInformer,
 	ccInformer mcfginformersv1.ControllerConfigInformer,
 	mcrInformer mcfginformersv1.ContainerRuntimeConfigInformer,
+	imgInformer cligoinformersv1.ImageInformer,
 	kubeClient clientset.Interface,
 	mcfgClient mcfgclientset.Interface,
 ) *Controller {
@@ -98,6 +104,12 @@ func New(
 		DeleteFunc: ctrl.deleteContainerRuntimeConfig,
 	})
 
+	// imgInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	// 	AddFunc:    ctrl.imageConfAdded,
+	// 	UpdateFunc: ctrl.imageConfUpdated,
+	// 	DeleteFunc: ctrl.imageConfDeleted,
+	// })
+
 	ctrl.syncHandler = ctrl.syncContainerRuntimeConfig
 	ctrl.enqueueContainerRuntimeConfig = ctrl.enqueue
 
@@ -109,6 +121,9 @@ func New(
 
 	ctrl.mccrLister = mcrInformer.Lister()
 	ctrl.mccrListerSynced = mcrInformer.Informer().HasSynced
+
+	ctrl.imgLister = imgInformer.Lister()
+	ctrl.imgListerSynced = imgInformer.Informer().HasSynced
 
 	return ctrl
 }
@@ -237,26 +252,26 @@ func (ctrl *Controller) handleErr(err error, key interface{}) {
 }
 
 // generateOriginalContainerRuntimeConfigs returns rendered default storage, and crio config files
-func (ctrl *Controller) generateOriginalContainerRuntimeConfigs(role string) (*ignv2_2types.File, *ignv2_2types.File, error) {
+func (ctrl *Controller) generateOriginalContainerRuntimeConfigs(role string) (*ignv2_2types.File, *ignv2_2types.File, *ignv2_2types.File, error) {
 	// Enumerate the controller config
 	cc, err := ctrl.ccLister.List(labels.Everything())
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not enumerate ControllerConfig %s", err)
+		return nil, nil, nil, fmt.Errorf("could not enumerate ControllerConfig %s", err)
 	}
 	if len(cc) == 0 {
-		return nil, nil, fmt.Errorf("controllerConfigList is empty")
+		return nil, nil, nil, fmt.Errorf("controllerConfigList is empty")
 	}
 	// Render the default templates
 	tmplPath := filepath.Join(ctrl.templatesDir, role)
 	rc := &mtmpl.RenderConfig{ControllerConfigSpec: &cc[0].Spec}
 	generatedConfigs, err := mtmpl.GenerateMachineConfigsForRole(rc, role, tmplPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generateMachineConfigsforRole failed with error %s", err)
+		return nil, nil, nil, fmt.Errorf("generateMachineConfigsforRole failed with error %s", err)
 	}
 	// Find generated storage.config, and crio.config
 	var (
-		config, gmcStorageConfig, gmcCRIOConfig *ignv2_2types.File
-		errStorage, errCRIO                     error
+		config, gmcStorageConfig, gmcCRIOConfig, gmcRegistriesConfig *ignv2_2types.File
+		errStorage, errCRIO, errRegistries                           error
 	)
 	// Find storage config
 	for _, gmc := range generatedConfigs {
@@ -274,11 +289,19 @@ func (ctrl *Controller) generateOriginalContainerRuntimeConfigs(role string) (*i
 			break
 		}
 	}
-	if errStorage != nil || errCRIO != nil {
-		return nil, nil, fmt.Errorf("could not generate old container runtime configs: %v, %v", errStorage, errCRIO)
+	// Find Registries config
+	for _, gmc := range generatedConfigs {
+		config, errCRIO = findRegistriesConfig(gmc)
+		if errRegistries == nil {
+			gmcRegistriesConfig = config
+			break
+		}
+	}
+	if errStorage != nil || errCRIO != nil || errRegistries != nil {
+		return nil, nil, nil, fmt.Errorf("could not generate old container runtime configs: %v, %v", errStorage, errCRIO)
 	}
 
-	return gmcStorageConfig, gmcCRIOConfig, nil
+	return gmcStorageConfig, gmcCRIOConfig, gmcRegistriesConfig, nil
 }
 
 func (ctrl *Controller) syncStatusOnly(cfg *mcfgv1.ContainerRuntimeConfig, err error, args ...interface{}) error {
@@ -315,8 +338,17 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 		return err
 	}
 
+	// Fetch the ImageConfig
+	imgcfg, err := ctrl.imgLister.Get("cluster")
+	if errors.IsNotFound(err) {
+		glog.V(2).Infof("ImageConfig doesn't exist or has been deleted")
+	} else if err != nil {
+		return err
+	}
+
 	// Deep-copy otherwise we are mutating our cache.
 	cfg = cfg.DeepCopy()
+	imgcfg = imgcfg.DeepCopy()
 
 	// Check for Deleted ContainerRuntimeConfig and optionally delete finalizers
 	if cfg.DeletionTimestamp != nil {
@@ -363,15 +395,15 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 			continue
 		}
 		// Generate the original ContainerRuntimeConfig
-		originalStorageIgn, originalCRIOIgn, err := ctrl.generateOriginalContainerRuntimeConfigs(role)
+		originalStorageIgn, originalCRIOIgn, originalRegistriesIgn, err := ctrl.generateOriginalContainerRuntimeConfigs(role)
 		if err != nil {
 			return ctrl.syncStatusOnly(cfg, err, "could not generate origin ContainerRuntime Configs: %v", err)
 		}
 
-		var storageTOML, crioTOML []byte
+		var storageTOML, crioTOML, RegistriesTOML []byte
 		ctrcfg := cfg.Spec.ContainerRuntimeConfig
 		if ctrcfg.OverlaySize != (resource.Quantity{}) {
-			storageTOML, err = ctrl.mergeConfigChanges(originalStorageIgn, cfg, mc, role, managedKey, isNotFound, updateStorageConfig)
+			storageTOML, err = ctrl.mergeConfigChanges(originalStorageIgn, cfg, mc, updateStorageConfig)
 			if err != nil {
 				glog.V(2).Infoln("------error in merging storageeeee------:", err)
 				fmt.Println("------error in merging storageeeee------:", err)
@@ -380,15 +412,27 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 		}
 		if ctrcfg.LogLevel != "" || ctrcfg.InfraImage != "" || ctrcfg.PidsLimit != 0 || ctrcfg.LogSizeMax != (resource.Quantity{}) {
 			glog.V(2).Infoln("------changing criooooooooo------:")
-			crioTOML, err = ctrl.mergeConfigChanges(originalCRIOIgn, cfg, mc, role, managedKey, isNotFound, updateCRIOConfig)
+			crioTOML, err = ctrl.mergeConfigChanges(originalCRIOIgn, cfg, mc, updateCRIOConfig)
 			if err != nil {
 				glog.V(2).Infoln(cfg, err, "error merging user changes to crio.conf: %v", err)
+			}
+		}
+		if imgcfg.Spec.RegistrySources.InsecureRegistries != nil || imgcfg.Spec.RegistrySources.BlockedRegistries != nil {
+			glog.V(2).Infoln("------changing registriessss------:")
+			dataURL, err := dataurl.DecodeString(originalRegistriesIgn.Contents.Source)
+			if err != nil {
+				glog.V(2).Infoln(cfg, err, "could not decode original registries config: %v", err)
+			}
+			RegistriesTOML, err = updateRegistriesConfig(dataURL.Data, imgcfg.Spec)
+			if err != nil {
+				glog.V(2).Infoln(cfg, err, "could not update container runtime config with new changes: %v", err)
 			}
 		}
 		if isNotFound {
 			mc = mtmpl.MachineConfigFromIgnConfig(role, managedKey, &ignv2_2types.Config{})
 		}
-		mc.Spec.Config = createNewCtrRuntimeConfigIgnition(storageTOML, crioTOML)
+		mc.Spec.Config = createNewCtrRuntimeConfigIgnition(storageTOML, crioTOML, RegistriesTOML)
+		fmt.Println("----grrrrr-------:", string(storageTOML), string(crioTOML), string(RegistriesTOML))
 		mc.ObjectMeta.Annotations = map[string]string{
 			ctrlcommon.GeneratedByControllerVersionAnnotationKey: version.Version.String(),
 		}
@@ -424,7 +468,7 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 
 // mergeConfigChanges retrieves the original/default config data from the templates, decodes it and merges in the changes given by the Custom Resource.
 // It then encodes the new data and returns it.
-func (ctrl *Controller) mergeConfigChanges(origFile *ignv2_2types.File, cfg *mcfgv1.ContainerRuntimeConfig, mc *mcfgv1.MachineConfig, role, managedKey string, isNotFound bool, update updateConfig) ([]byte, error) {
+func (ctrl *Controller) mergeConfigChanges(origFile *ignv2_2types.File, cfg *mcfgv1.ContainerRuntimeConfig, mc *mcfgv1.MachineConfig, update updateConfig) ([]byte, error) {
 	dataURL, err := dataurl.DecodeString(origFile.Contents.Source)
 	if err != nil {
 		return nil, ctrl.syncStatusOnly(cfg, err, "could not decode original Container Runtime config: %v", err)

@@ -51,8 +51,8 @@ func CreateControllerContext(cb *ClientBuilder, stop <-chan struct{}, targetName
 		KubeNamespacedInformerFactory: kubeNamespacedSharedInformer,
 		APIExtInformerFactory:         apiExtSharedInformer,
 		ConfigInformerFactory:         configSharedInformer,
-		Stop:             stop,
-		InformersStarted: make(chan struct{}),
-		ResyncPeriod:     resyncPeriod(),
+		Stop:                          stop,
+		InformersStarted:              make(chan struct{}),
+		ResyncPeriod:                  resyncPeriod(),
 	}
 }

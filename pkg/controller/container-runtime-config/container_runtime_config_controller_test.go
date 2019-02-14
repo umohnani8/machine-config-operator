@@ -24,6 +24,8 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	ignv2_2types "github.com/coreos/ignition/config/v2_2/types"
+	apicfgv1 "github.com/openshift/api/config/v1"
+	cligoinformersv1 "github.com/openshift/client-go/config/informers/externalversions"
 	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	"github.com/openshift/machine-config-operator/pkg/generated/clientset/versioned/fake"
 	informers "github.com/openshift/machine-config-operator/pkg/generated/informers/externalversions"
@@ -46,6 +48,7 @@ type fixture struct {
 	ccLister   []*mcfgv1.ControllerConfig
 	mcpLister  []*mcfgv1.MachineConfigPool
 	mccrLister []*mcfgv1.ContainerRuntimeConfig
+	imgLister  []*apicfgv1.Image
 
 	actions []core.Action
 
@@ -109,14 +112,26 @@ func newContainerRuntimeConfig(name string, ctrconf *mcfgv1.ContainerRuntimeConf
 	}
 }
 
+func newImageConfig(name string, imgconf *apicfgv1.RegistrySources) *apicfgv1.Image {
+	return &apicfgv1.Image{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apicfgv1.SchemeGroupVersion.String()},
+		ObjectMeta: metav1.ObjectMeta{Name: name, UID: types.UID(utilrand.String(5)), Generation: 1},
+		Spec: apicfgv1.ImageSpec{
+			RegistrySources: *imgconf,
+		},
+	}
+}
+
 func (f *fixture) newController() (*Controller, informers.SharedInformerFactory) {
 	f.client = fake.NewSimpleClientset(f.objects...)
 
 	i := informers.NewSharedInformerFactory(f.client, noResyncPeriodFunc())
+	cli := cligoinformersv1.NewSharedInformerFactory(f.client, noResyncPeriodFunc())
 	c := New(templateDir,
 		i.Machineconfiguration().V1().MachineConfigPools(),
 		i.Machineconfiguration().V1().ControllerConfigs(),
 		i.Machineconfiguration().V1().ContainerRuntimeConfigs(),
+		cli.Config().V1().Images(),
 		k8sfake.NewSimpleClientset(), f.client)
 
 	c.mcpListerSynced = alwaysReady
@@ -274,12 +289,14 @@ func TestContainerRuntimeConfigCreate(t *testing.T) {
 			mcp2 := newMachineConfigPool("worker", map[string]string{"custom-crio": "storage-config"}, metav1.AddLabelToSelector(&metav1.LabelSelector{}, "node-role", "worker"), "v0")
 			ctrcfg1 := newContainerRuntimeConfig("set-log-level", &mcfgv1.ContainerRuntimeConfiguration{LogLevel: "debug", LogSizeMax: resource.MustParse("9k"), OverlaySize: resource.MustParse("3G")}, metav1.AddLabelToSelector(&metav1.LabelSelector{}, "custom-crio", "my-config"))
 			mcs := newMachineConfig(getManagedKey(mcp, ctrcfg1), map[string]string{"node-role": "master"}, "dummy://", []ignv2_2types.File{{}})
+			imgcfg1 := newImageConfig("test-image", &apicfgv1.RegistrySources{InsecureRegistries: []string{"blah.io"}})
 
 			f.ccLister = append(f.ccLister, cc)
 			f.mcpLister = append(f.mcpLister, mcp)
 			f.mcpLister = append(f.mcpLister, mcp2)
 			f.mccrLister = append(f.mccrLister, ctrcfg1)
-			f.objects = append(f.objects, ctrcfg1)
+			f.imgLister = append(f.imgLister, imgcfg1)
+			f.objects = append(f.objects, ctrcfg1, imgcfg1)
 
 			f.expectGetMachineConfigAction(mcs)
 			f.expectUpdateContainerRuntimeConfig(ctrcfg1)

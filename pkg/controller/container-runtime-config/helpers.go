@@ -9,9 +9,11 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"github.com/containers/image/pkg/sysregistriesv2"
 	storageconfig "github.com/containers/storage/pkg/config"
 	ignv2_2types "github.com/coreos/ignition/config/v2_2/types"
 	crioconfig "github.com/kubernetes-sigs/cri-o/pkg/config"
+	apicfgv1 "github.com/openshift/api/config/v1"
 	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	"github.com/vincent-petithory/dataurl"
 
@@ -19,10 +21,11 @@ import (
 )
 
 const (
-	minLogSize        = 8192
-	minPidsLimit      = 20
-	crioConfigPath    = "/etc/crio/crio.conf"
-	storageConfigPath = "/etc/containers/storage.conf"
+	minLogSize           = 8192
+	minPidsLimit         = 20
+	crioConfigPath       = "/etc/crio/crio.conf"
+	storageConfigPath    = "/etc/containers/storage.conf"
+	registriesConfigPath = "/etc/containers/registries.conf"
 )
 
 // TOML-friendly explicit tables used for conversions.
@@ -48,53 +51,15 @@ type tomlConfigCRIO struct {
 	} `toml:"crio"`
 }
 
-// type newIgnition func([]byte) ignv2_2types.Config
+type tomlConfigRegistries struct {
+	Registries []sysregistriesv2.Registry `toml:"registry"`
+	// backwards compatability to sysregistries v1
+	sysregistriesv2.V1TOMLConfig `toml:"registries"`
+}
 
 type updateConfig func(data []byte, internal *mcfgv1.ContainerRuntimeConfiguration) ([]byte, error)
 
-// func createNewStorageIgnition(tomlconfig []byte) ignv2_2types.Config {
-// 	var tempIgnConfig ignv2_2types.Config
-// 	mode := 0644
-// 	du := dataurl.New(tomlconfig, "text/plain")
-// 	du.Encoding = dataurl.EncodingASCII
-// 	tempFile := ignv2_2types.File{
-// 		Node: ignv2_2types.Node{
-// 			Filesystem: "root",
-// 			Path:       storageConfigPath,
-// 		},
-// 		FileEmbedded1: ignv2_2types.FileEmbedded1{
-// 			Mode: &mode,
-// 			Contents: ignv2_2types.FileContents{
-// 				Source: du.String(),
-// 			},
-// 		},
-// 	}
-// 	tempIgnConfig.Storage.Files = append(tempIgnConfig.Storage.Files, tempFile)
-// 	return tempIgnConfig
-// }
-
-// func createNewCRIOIgnition(tomlconfig []byte) ignv2_2types.Config {
-// 	var tempIgnConfig ignv2_2types.Config
-// 	mode := 0644
-// 	du := dataurl.New(tomlconfig, "text/plain")
-// 	du.Encoding = dataurl.EncodingASCII
-// 	tempFile := ignv2_2types.File{
-// 		Node: ignv2_2types.Node{
-// 			Filesystem: "root",
-// 			Path:       crioConfigPath,
-// 		},
-// 		FileEmbedded1: ignv2_2types.FileEmbedded1{
-// 			Mode: &mode,
-// 			Contents: ignv2_2types.FileContents{
-// 				Source: du.String(),
-// 			},
-// 		},
-// 	}
-// 	tempIgnConfig.Storage.Files = append(tempIgnConfig.Storage.Files, tempFile)
-// 	return tempIgnConfig
-// }
-
-func createNewCtrRuntimeConfigIgnition(storageTOMLConfig, crioTOMLConfig []byte) ignv2_2types.Config {
+func createNewCtrRuntimeConfigIgnition(storageTOMLConfig, crioTOMLConfig, registriesTOMLConfig []byte) ignv2_2types.Config {
 	var tempIgnConfig ignv2_2types.Config
 	mode := 0644
 
@@ -136,6 +101,25 @@ func createNewCtrRuntimeConfigIgnition(storageTOMLConfig, crioTOMLConfig []byte)
 		tempIgnConfig.Storage.Files = append(tempIgnConfig.Storage.Files, crioTempFile)
 	}
 
+	// Create Registries ignition
+	if registriesTOMLConfig != nil {
+		regdu := dataurl.New(crioTOMLConfig, "text/plain")
+		regdu.Encoding = dataurl.EncodingASCII
+		regTempFile := ignv2_2types.File{
+			Node: ignv2_2types.Node{
+				Filesystem: "root",
+				Path:       registriesConfigPath,
+			},
+			FileEmbedded1: ignv2_2types.FileEmbedded1{
+				Mode: &mode,
+				Contents: ignv2_2types.FileContents{
+					Source: regdu.String(),
+				},
+			},
+		}
+		tempIgnConfig.Storage.Files = append(tempIgnConfig.Storage.Files, regTempFile)
+	}
+
 	return tempIgnConfig
 
 }
@@ -156,6 +140,15 @@ func findCRIOConfig(mc *mcfgv1.MachineConfig) (*ignv2_2types.File, error) {
 		}
 	}
 	return nil, fmt.Errorf("could not find CRI-O Config")
+}
+
+func findRegistriesConfig(mc *mcfgv1.MachineConfig) (*ignv2_2types.File, error) {
+	for _, c := range mc.Spec.Config.Storage.Files {
+		if c.Path == registriesConfigPath {
+			return &c, nil
+		}
+	}
+	return nil, fmt.Errorf("could not find Registries Config")
 }
 
 func getManagedKey(pool *mcfgv1.MachineConfigPool, config *mcfgv1.ContainerRuntimeConfig) string {
@@ -226,6 +219,28 @@ func updateCRIOConfig(data []byte, internal *mcfgv1.ContainerRuntimeConfiguratio
 	}
 	if internal.InfraImage != "" {
 		tomlConf.Crio.Image.PauseImage = internal.InfraImage
+	}
+
+	var newData bytes.Buffer
+	encoder := toml.NewEncoder(&newData)
+	if err := encoder.Encode(*tomlConf); err != nil {
+		return nil, err
+	}
+
+	return newData.Bytes(), nil
+}
+
+func updateRegistriesConfig(data []byte, internal apicfgv1.ImageSpec) ([]byte, error) {
+	tomlConf := new(tomlConfigRegistries)
+	if _, err := toml.Decode(string(data), tomlConf); err != nil {
+		return nil, fmt.Errorf("error unmarshalling registries config: %v", err)
+	}
+
+	if internal.RegistrySources.InsecureRegistries != nil {
+		tomlConf.Insecure = sysregistriesv2.V1TOMLregistries{Registries: internal.RegistrySources.InsecureRegistries}
+	}
+	if internal.RegistrySources.BlockedRegistries != nil {
+		tomlConf.Block = sysregistriesv2.V1TOMLregistries{Registries: internal.RegistrySources.BlockedRegistries}
 	}
 
 	var newData bytes.Buffer

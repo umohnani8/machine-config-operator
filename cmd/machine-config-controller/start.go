@@ -120,6 +120,7 @@ func startControllers(ctx *common.ControllerContext) error {
 		ctx.InformerFactory.Machineconfiguration().V1().MachineConfigPools(),
 		ctx.InformerFactory.Machineconfiguration().V1().ControllerConfigs(),
 		ctx.InformerFactory.Machineconfiguration().V1().ContainerRuntimeConfigs(),
+		ctx.ConfigInformerFactory.Config().V1().Images(),
 		ctx.ClientBuilder.KubeClientOrDie("container-runtime-config-controller"),
 		ctx.ClientBuilder.MachineConfigClientOrDie("container-runtime-config-controller"),
 	).Run(2, ctx.Stop)
