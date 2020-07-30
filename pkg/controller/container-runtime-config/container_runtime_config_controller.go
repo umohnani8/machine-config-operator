@@ -424,18 +424,30 @@ func generateOriginalContainerRuntimeConfigs(templateDir string, cc *mcfgv1.Cont
 
 func (ctrl *Controller) syncStatusOnly(cfg *mcfgv1.ContainerRuntimeConfig, err error, args ...interface{}) error {
 	statusUpdateErr := retry.RetryOnConflict(updateBackoff, func() error {
-		if cfg.GetGeneration() != cfg.Status.ObservedGeneration {
-			cfg.Status.ObservedGeneration = cfg.GetGeneration()
-			cfg.Status.Conditions = append(cfg.Status.Conditions, wrapErrorWithCondition(err, args...))
-		} else if cfg.GetGeneration() == cfg.Status.ObservedGeneration && err == nil {
-			// If the CR was created before a matching label was added, the CR would be in failure state
-			// However the observed generation would be the same, so check if err is nil as well
-			// Which means that, the ctrcfg was finally successfully able to sync. In that case update the status
-			// to success and clear the previous failure status
-			cfg.Status.Conditions = []mcfgv1.ContainerRuntimeConfigCondition{wrapErrorWithCondition(err, args...)}
+		fmt.Println("------observed generation-----:", cfg.Status.ObservedGeneration)
+		fmt.Println("-----generation-------:", cfg.GetGeneration())
+		newcfg, getErr := ctrl.mccrLister.Get(cfg.Name)
+		if getErr != nil {
+			return getErr
 		}
-		_, updateErr := ctrl.client.MachineconfigurationV1().ContainerRuntimeConfigs().UpdateStatus(context.TODO(), cfg, metav1.UpdateOptions{})
-		return updateErr
+		if newcfg.GetGeneration() != newcfg.Status.ObservedGeneration {
+			newcfg.Status.ObservedGeneration = newcfg.GetGeneration()
+		}
+		fmt.Println("------new observed generation-----:", newcfg.Status.ObservedGeneration)
+		fmt.Println("-----new generation-------:", newcfg.GetGeneration())
+		fmt.Println("------new observed generation-----:", newcfg.Status.ObservedGeneration)
+		fmt.Println("-----new generation-------:", newcfg.GetGeneration())
+		// Only append a status condition if it is different from the previous one
+		newStatusCondition := wrapErrorWithCondition(err, args...)
+		if len(newcfg.Status.Conditions) == 0 || newStatusCondition.Message != newcfg.Status.Conditions[len(newcfg.Status.Conditions)-1].Message {
+			fmt.Println("----appending----")
+			newcfg.Status.Conditions = append(newcfg.Status.Conditions, newStatusCondition)
+		} else if newcfg.Status.Conditions[len(newcfg.Status.Conditions)-1].Message == newStatusCondition.Message {
+			fmt.Println("----replacing last status----")
+			newcfg.Status.Conditions[len(newcfg.Status.Conditions)-1] = newStatusCondition
+		}
+		_, lerr := ctrl.client.MachineconfigurationV1().ContainerRuntimeConfigs().UpdateStatus(context.TODO(), newcfg, metav1.UpdateOptions{})
+		return lerr
 	})
 	// If an error occurred in updating the status just log it
 	if statusUpdateErr != nil {
@@ -481,18 +493,18 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 	}
 
 	// If we have seen this generation and the sync didn't fail, then skip
-	if cfg.Status.ObservedGeneration >= cfg.Generation && cfg.Status.Conditions[len(cfg.Status.Conditions)-1].Type == mcfgv1.ContainerRuntimeConfigSuccess {
-		// This is the scenario for upgrades where we are moving from crio.conf to crio.conf.d
-		// this can be removed in the next release
-		fromOldCrio, err := ctrl.isUpdatingFromOldCRIOConf(cfg)
-		if err != nil {
-			return fmt.Errorf("error checking if we are updating from crio.conf: %v", err)
-		}
-		// We want to trigger a resync if we are updating from a version where crio.conf.d didn't exist
-		if !fromOldCrio {
-			return nil
-		}
-	}
+	// if cfg.Status.ObservedGeneration >= cfg.Generation {
+	// 	// This is the scenario for upgrades where we are moving from crio.conf to crio.conf.d
+	// 	// this can be removed in the next release
+	// 	fromOldCrio, err := ctrl.isUpdatingFromOldCRIOConf(cfg)
+	// 	if err != nil {
+	// 		return fmt.Errorf("error checking if we are updating from crio.conf: %v", err)
+	// 	}
+	// 	// We want to trigger a resync if we are updating from a version where crio.conf.d didn't exist
+	// 	if !fromOldCrio {
+	// 		return nil
+	// 	}
+	// }
 
 	// Validate the ContainerRuntimeConfig CR
 	if err := validateUserContainerRuntimeConfig(cfg); err != nil {
@@ -521,70 +533,89 @@ func (ctrl *Controller) syncContainerRuntimeConfig(key string) error {
 		role := pool.Name
 		// Get MachineConfig
 		managedKey := getManagedKeyCtrCfg(pool)
+		mc, err := ctrl.client.MachineconfigurationV1().MachineConfigs().Get(context.TODO(), managedKey, metav1.GetOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			return ctrl.syncStatusOnly(cfg, err, "could not find MachineConfig: %v", managedKey)
+		}
+		isNotFound := errors.IsNotFound(err)
+		// If we have seen this generation and the sync didn't fail, then skip
+		if !isNotFound && cfg.Status.ObservedGeneration >= cfg.Generation && cfg.Status.Conditions[len(cfg.Status.Conditions)-1].Type == mcfgv1.ContainerRuntimeConfigSuccess {
+			// But we still need to compare the generated controller version because during an upgrade we need a new one
+			mcCtrlVersion := mc.Annotations[ctrlcommon.GeneratedByControllerVersionAnnotationKey]
+			if mcCtrlVersion == version.Hash {
+				fmt.Println("----same hash so returning nil----")
+				return nil
+			}
+			// This is the scenario for upgrades where we are moving from crio.conf to crio.conf.d
+			// this can be removed in the next release
+			// fromOldCrio, err := ctrl.isUpdatingFromOldCRIOConf(cfg)
+			// if err != nil {
+			// 	return fmt.Errorf("error checking if we are updating from crio.conf: %v", err)
+			// }
+			// // We want to trigger a resync if we are updating from a version where crio.conf.d didn't exist
+			// if !fromOldCrio {
+			// 	return nil
+			// }
+		}
+		// Generate the original ContainerRuntimeConfig
+		originalStorageIgn, _, _, err := generateOriginalContainerRuntimeConfigs(ctrl.templatesDir, controllerConfig, role)
+		if err != nil {
+			return ctrl.syncStatusOnly(cfg, err, "could not generate origin ContainerRuntime Configs: %v", err)
+		}
+
+		var configFileList []generatedConfigFile
+		ctrcfg := cfg.Spec.ContainerRuntimeConfig
+		if ctrcfg.OverlaySize != (resource.Quantity{}) {
+			storageTOML, err := ctrl.mergeConfigChanges(originalStorageIgn, cfg, updateStorageConfig)
+			if err != nil {
+				glog.V(2).Infoln(cfg, err, "error merging user changes to storage.conf: %v", err)
+			} else {
+				configFileList = append(configFileList, generatedConfigFile{filePath: storageConfigPath, data: storageTOML})
+			}
+		}
+
+		// Create the cri-o drop-in files
+		if ctrcfg.LogLevel != "" || ctrcfg.PidsLimit != 0 || ctrcfg.LogSizeMax != (resource.Quantity{}) {
+			crioFileConfigs := createCRIODropinFiles(cfg)
+			configFileList = append(configFileList, crioFileConfigs...)
+		}
+
+		if isNotFound {
+			tempIgnCfg := ctrlcommon.NewIgnConfig()
+			mc, err = mtmpl.MachineConfigFromIgnConfig(role, managedKey, tempIgnCfg)
+			if err != nil {
+				return ctrl.syncStatusOnly(cfg, err, "could not create MachineConfig from new Ignition config: %v", err)
+			}
+		}
+
+		ctrRuntimeConfigIgn := createNewIgnition(configFileList)
+		rawCtrRuntimeConfigIgn, err := json.Marshal(ctrRuntimeConfigIgn)
+		if err != nil {
+			return ctrl.syncStatusOnly(cfg, err, "error marshalling container runtime config Ignition: %v", err)
+		}
+		mc.Spec.Config.Raw = rawCtrRuntimeConfigIgn
+
+		mc.SetAnnotations(map[string]string{
+			ctrlcommon.GeneratedByControllerVersionAnnotationKey: version.Hash,
+		})
+		oref := metav1.NewControllerRef(cfg, controllerKind)
+		mc.SetOwnerReferences([]metav1.OwnerReference{*oref})
+
+		// Create or Update, on conflict retry
 		if err := retry.RetryOnConflict(updateBackoff, func() error {
-			mc, err := ctrl.client.MachineconfigurationV1().MachineConfigs().Get(context.TODO(), managedKey, metav1.GetOptions{})
-			if err != nil && !errors.IsNotFound(err) {
-				return ctrl.syncStatusOnly(cfg, err, "could not find MachineConfig: %v", managedKey)
-			}
-			isNotFound := errors.IsNotFound(err)
-			// Generate the original ContainerRuntimeConfig
-			originalStorageIgn, _, _, err := generateOriginalContainerRuntimeConfigs(ctrl.templatesDir, controllerConfig, role)
-			if err != nil {
-				return ctrl.syncStatusOnly(cfg, err, "could not generate origin ContainerRuntime Configs: %v", err)
-			}
-
-			var configFileList []generatedConfigFile
-			ctrcfg := cfg.Spec.ContainerRuntimeConfig
-			if ctrcfg.OverlaySize != (resource.Quantity{}) {
-				storageTOML, err := ctrl.mergeConfigChanges(originalStorageIgn, cfg, updateStorageConfig)
-				if err != nil {
-					glog.V(2).Infoln(cfg, err, "error merging user changes to storage.conf: %v", err)
-				} else {
-					configFileList = append(configFileList, generatedConfigFile{filePath: storageConfigPath, data: storageTOML})
-				}
-			}
-
-			// Create the cri-o drop-in files
-			if ctrcfg.LogLevel != "" || ctrcfg.PidsLimit != 0 || ctrcfg.LogSizeMax != (resource.Quantity{}) {
-				crioFileConfigs := createCRIODropinFiles(cfg)
-				configFileList = append(configFileList, crioFileConfigs...)
-			}
-
-			if isNotFound {
-				tempIgnCfg := ctrlcommon.NewIgnConfig()
-				mc, err = mtmpl.MachineConfigFromIgnConfig(role, managedKey, tempIgnCfg)
-				if err != nil {
-					return ctrl.syncStatusOnly(cfg, err, "could not create MachineConfig from new Ignition config: %v", err)
-				}
-			}
-
-			ctrRuntimeConfigIgn := createNewIgnition(configFileList)
-			rawCtrRuntimeConfigIgn, err := json.Marshal(ctrRuntimeConfigIgn)
-			if err != nil {
-				return ctrl.syncStatusOnly(cfg, err, "error marshalling container runtime config Ignition: %v", err)
-			}
-			mc.Spec.Config.Raw = rawCtrRuntimeConfigIgn
-
-			mc.SetAnnotations(map[string]string{
-				ctrlcommon.GeneratedByControllerVersionAnnotationKey: version.Hash,
-			})
-			oref := metav1.NewControllerRef(cfg, controllerKind)
-			mc.SetOwnerReferences([]metav1.OwnerReference{*oref})
-
-			// Create or Update, on conflict retry
+			var err error
 			if isNotFound {
 				_, err = ctrl.client.MachineconfigurationV1().MachineConfigs().Create(context.TODO(), mc, metav1.CreateOptions{})
 			} else {
 				_, err = ctrl.client.MachineconfigurationV1().MachineConfigs().Update(context.TODO(), mc, metav1.UpdateOptions{})
 			}
-
-			// Add Finalizers to the ContainerRuntimeConfigs
-			if err := ctrl.addFinalizerToContainerRuntimeConfig(cfg, mc); err != nil {
-				return ctrl.syncStatusOnly(cfg, err, "could not add finalizers to ContainerRuntimeConfig: %v", err)
-			}
 			return err
 		}); err != nil {
 			return ctrl.syncStatusOnly(cfg, err, "could not Create/Update MachineConfig: %v", err)
+		}
+		// Add Finalizers to the ContainerRuntimeConfigs
+		if err := ctrl.addFinalizerToContainerRuntimeConfig(cfg, mc); err != nil {
+			return ctrl.syncStatusOnly(cfg, err, "could not add finalizers to ContainerRuntimeConfig: %v", err)
 		}
 		glog.Infof("Applied ContainerRuntimeConfig %v on MachineConfigPool %v", key, pool.Name)
 	}
@@ -864,7 +895,12 @@ func (ctrl *Controller) addFinalizerToContainerRuntimeConfig(ctrCfg *mcfgv1.Cont
 		}
 
 		ctrCfgTmp := newcfg.DeepCopy()
-		ctrCfgTmp.Finalizers = append(ctrCfgTmp.Finalizers, mc.Name)
+		fmt.Println("-----ctrcfg finalizer-----:", ctrCfgTmp.Finalizers)
+		if !isInArr(ctrCfgTmp.Finalizers, mc.Name) {
+			fmt.Println("---not in finalizers so adding-----")
+			ctrCfgTmp.Finalizers = append(ctrCfgTmp.Finalizers, mc.Name)
+		}
+		fmt.Println("-----ctrcfgtmp finalizer-----:", ctrCfgTmp.Finalizers)
 
 		modJSON, err := json.Marshal(ctrCfgTmp)
 		if err != nil {

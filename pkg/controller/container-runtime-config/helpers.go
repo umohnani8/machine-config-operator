@@ -403,3 +403,12 @@ func getValidBlockedRegistries(clusterVersionStatus *apicfgv1.ClusterVersionStat
 	}
 	return blockedRegs, nil
 }
+
+func isInArr(arr []string, element string) bool {
+	for _, a := range arr {
+		if a == element {
+			return true
+		}
+	}
+	return false
+}
