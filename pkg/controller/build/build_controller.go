@@ -565,13 +565,13 @@ func (ctrl *Controller) markBuildInterrupted(mosc *mcfgv1alpha1.MachineOSConfig,
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuildPrepared),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Prepared",
+				Reason:  "Prepared and pending",
 				Message: "Build Prepared and Pending",
 			},
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuilding),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Running",
+				Reason:  "BuildRunning",
 				Message: "Image Build In Progress",
 			},
 			{
@@ -612,13 +612,13 @@ func (ctrl *Controller) markBuildFailed(mosc *mcfgv1alpha1.MachineOSConfig, mosb
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuildPrepared),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Prepared",
+				Reason:  "Prepared and pending",
 				Message: "Build Prepared and Pending",
 			},
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuilding),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Running",
+				Reason:  "BuildRunning",
 				Message: "Image Build In Progress",
 			},
 			{
@@ -657,13 +657,13 @@ func (ctrl *Controller) markBuildInProgress(mosb *mcfgv1alpha1.MachineOSBuild) e
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuildPrepared),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Prepared",
+				Reason:  "Prepared and pending",
 				Message: "Build Prepared and Pending",
 			},
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuilding),
 				Status:  metav1.ConditionTrue,
-				Reason:  "Running",
+				Reason:  "BuildRunning",
 				Message: "Image Build In Progress",
 			},
 			{
@@ -694,10 +694,6 @@ func (ctrl *Controller) markBuildInProgress(mosb *mcfgv1alpha1.MachineOSBuild) e
 func (ctrl *Controller) markBuildSucceeded(mosc *mcfgv1alpha1.MachineOSConfig, mosb *mcfgv1alpha1.MachineOSBuild) error {
 	klog.Infof("Build %s succeeded for MachineConfigPool %s, config %s", mosb.Name, mosc.Spec.MachineConfigPool.Name, mosb.Spec.DesiredConfig.Name)
 
-	// if err := ctrl.postBuildCleanup(mosb, mosc, false); err != nil {
-	// 	return fmt.Errorf("could not do post-build cleanup: %w", err)
-	// }
-
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 
 		// Get the final image pullspec
@@ -719,13 +715,13 @@ func (ctrl *Controller) markBuildSucceeded(mosc *mcfgv1alpha1.MachineOSConfig, m
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuildPrepared),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Prepared",
+				Reason:  "Prepared and pending",
 				Message: "Build Prepared and Pending",
 			},
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuilding),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Running",
+				Reason:  "BuildRunning",
 				Message: "Image Build In Progress",
 			},
 			{
@@ -765,13 +761,13 @@ func (ctrl *Controller) markBuildPendingWithObjectRef(mosc *mcfgv1alpha1.Machine
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuildPrepared),
 				Status:  metav1.ConditionTrue,
-				Reason:  "Prepared",
+				Reason:  "Prepared and pending",
 				Message: "Build Prepared and Pending",
 			},
 			{
 				Type:    string(mcfgv1alpha1.MachineOSBuilding),
 				Status:  metav1.ConditionFalse,
-				Reason:  "Running",
+				Reason:  "BuildRunning",
 				Message: "Image Build In Progress",
 			},
 			{
