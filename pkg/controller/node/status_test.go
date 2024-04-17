@@ -275,7 +275,7 @@ func TestGetUpdatedMachines(t *testing.T) {
 
 			pool := poolBuilder.MachineConfigPool()
 
-			updated := getUpdatedMachines(pool, test.nodes)
+			updated := getUpdatedMachines(pool, test.nodes, nil, nil, test.layeredPool)
 			assertExpectedNodes(t, getNamesFromNodes(test.updated), updated)
 
 			// This is a much tighter assertion than the one I added. Not sure if
@@ -299,6 +299,7 @@ func TestGetReadyMachines(t *testing.T) {
 		currentConfig string
 		currentImage  string
 		ready         []*corev1.Node
+		layered       bool
 	}{{
 		name:          "no nodes",
 		nodes:         []*corev1.Node{},
@@ -350,6 +351,7 @@ func TestGetReadyMachines(t *testing.T) {
 		currentConfig: machineConfigV1,
 		currentImage:  imageV1,
 		ready:         []*corev1.Node{newLayeredNode("node-1", machineConfigV1, machineConfigV1, imageV1, imageV1)},
+		layered:       true,
 	}, {
 		name: "2 layered nodes updated, one node has layering mismatch",
 		nodes: []*corev1.Node{
@@ -362,6 +364,7 @@ func TestGetReadyMachines(t *testing.T) {
 		ready: []*corev1.Node{
 			newLayeredNode("node-1", machineConfigV1, machineConfigV1, imageV1, imageV1),
 		},
+		layered: true,
 	},
 		{
 			name: "2 nodes updated, one node has layering mismatch",
@@ -375,6 +378,7 @@ func TestGetReadyMachines(t *testing.T) {
 			ready: []*corev1.Node{
 				newNode("node-1", machineConfigV1, machineConfigV1),
 			},
+			layered: true,
 		},
 	}
 
@@ -392,7 +396,7 @@ func TestGetReadyMachines(t *testing.T) {
 
 			pool := poolBuilder.MachineConfigPool()
 
-			ready := getReadyMachines(pool, test.nodes)
+			ready := getReadyMachines(pool, test.nodes, nil, nil, test.layered)
 			if !reflect.DeepEqual(ready, test.ready) {
 				t.Fatalf("mismatch expected: %v got %v", test.ready, ready)
 			}
@@ -588,7 +592,7 @@ func TestGetUnavailableMachines(t *testing.T) {
 
 			pool := pb.MachineConfigPool()
 
-			unavailableNodes := getUnavailableMachines(test.nodes, pool)
+			unavailableNodes := getUnavailableMachines(test.nodes, pool, test.layeredPool, nil)
 			assertExpectedNodes(t, test.unavail, unavailableNodes)
 		})
 	}
@@ -938,7 +942,9 @@ func TestCalculateStatus(t *testing.T) {
 					Paused:        test.paused,
 				},
 			}
-			status := calculateStatus([]*mcfgalphav1.MachineConfigNode{}, nil, pool, test.nodes)
+			f := newFixture(t)
+			c := f.newController()
+			status := c.calculateStatus([]*mcfgalphav1.MachineConfigNode{}, nil, pool, test.nodes, nil, nil)
 			test.verify(status, t)
 		})
 	}
