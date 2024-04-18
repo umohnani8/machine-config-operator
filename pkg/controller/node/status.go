@@ -6,15 +6,12 @@ import (
 	"strings"
 
 	configv1 "github.com/openshift/api/config/v1"
-
-	mcfgalphav1 "github.com/openshift/api/machineconfiguration/v1alpha1"
 	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
 	helpers "github.com/openshift/machine-config-operator/pkg/helpers"
 
 	mcfgv1 "github.com/openshift/api/machineconfiguration/v1"
 	"github.com/openshift/machine-config-operator/pkg/apihelpers"
 	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
-	"github.com/openshift/machine-config-operator/pkg/daemon/constants"
 	daemonconsts "github.com/openshift/machine-config-operator/pkg/daemon/constants"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -33,7 +30,7 @@ func (ctrl *Controller) syncStatusOnly(pool *mcfgv1.MachineConfigPool) error {
 		return err
 	}
 
-	machineConfigStates := []*mcfgalphav1.MachineConfigNode{}
+	machineConfigStates := []*mcfgv1alpha1.MachineConfigNode{}
 	fg, err := ctrl.fgAcessor.CurrentFeatureGates()
 	list := fg.KnownFeatures()
 	mcnExists := false
@@ -55,7 +52,7 @@ func (ctrl *Controller) syncStatusOnly(pool *mcfgv1.MachineConfigPool) error {
 		}
 	}
 
-	mosc, mosb, _ := ctrl.GetConfigAndBuild(pool)
+	mosc, mosb, _ := ctrl.getConfigAndBuild(pool)
 
 	newStatus := ctrl.calculateStatus(machineConfigStates, cc, pool, nodes, mosc, mosb)
 	if equality.Semantic.DeepEqual(pool.Status, newStatus) {
@@ -78,7 +75,7 @@ func (ctrl *Controller) syncStatusOnly(pool *mcfgv1.MachineConfigPool) error {
 }
 
 //nolint:gocyclo
-func (ctrl *Controller) calculateStatus(mcs []*mcfgalphav1.MachineConfigNode, cconfig *mcfgv1.ControllerConfig, pool *mcfgv1.MachineConfigPool, nodes []*corev1.Node, mosc *mcfgalphav1.MachineOSConfig, mosb *mcfgv1alpha1.MachineOSBuild) mcfgv1.MachineConfigPoolStatus {
+func (ctrl *Controller) calculateStatus(mcs []*mcfgv1alpha1.MachineConfigNode, cconfig *mcfgv1.ControllerConfig, pool *mcfgv1.MachineConfigPool, nodes []*corev1.Node, mosc *mcfgv1alpha1.MachineOSConfig, mosb *mcfgv1alpha1.MachineOSBuild) mcfgv1.MachineConfigPoolStatus {
 	certExpirys := []mcfgv1.CertExpiry{}
 	if cconfig != nil {
 		for _, cert := range cconfig.Status.ControllerCertificates {
@@ -126,27 +123,27 @@ func (ctrl *Controller) calculateStatus(mcs []*mcfgalphav1.MachineConfigNode, cc
 				continue
 			}
 			if cond.Status == metav1.ConditionUnknown {
-				switch mcfgalphav1.StateProgress(cond.Type) {
-				case mcfgalphav1.MachineConfigNodeUpdatePrepared:
+				switch mcfgv1alpha1.StateProgress(cond.Type) {
+				case mcfgv1alpha1.MachineConfigNodeUpdatePrepared:
 					updatingMachines = append(updatedMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdateExecuted:
+				case mcfgv1alpha1.MachineConfigNodeUpdateExecuted:
 					updatingMachines = append(updatingMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdatePostActionComplete:
+				case mcfgv1alpha1.MachineConfigNodeUpdatePostActionComplete:
 					updatingMachines = append(updatingMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdateComplete:
+				case mcfgv1alpha1.MachineConfigNodeUpdateComplete:
 					updatingMachines = append(updatingMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeResumed:
+				case mcfgv1alpha1.MachineConfigNodeResumed:
 					updatedMachines = append(updatingMachines, ourNode)
 					readyMachines = append(readyMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdateCompatible:
+				case mcfgv1alpha1.MachineConfigNodeUpdateCompatible:
 					updatedMachines = append(updatingMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdateDrained:
+				case mcfgv1alpha1.MachineConfigNodeUpdateDrained:
 					unavailableMachines = append(unavailableMachines, ourNode)
 					updatingMachines = append(updatingMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdateCordoned:
+				case mcfgv1alpha1.MachineConfigNodeUpdateCordoned:
 					unavailableMachines = append(unavailableMachines, ourNode)
 					updatingMachines = append(updatingMachines, ourNode)
-				case mcfgalphav1.MachineConfigNodeUpdated:
+				case mcfgv1alpha1.MachineConfigNodeUpdated:
 					updatedMachines = append(updatedMachines, ourNode)
 					readyMachines = append(readyMachines, ourNode)
 				}
@@ -230,7 +227,7 @@ func (ctrl *Controller) calculateStatus(mcs []*mcfgalphav1.MachineConfigNode, cc
 
 	var nodeDegraded bool
 	for _, m := range degradedMachines {
-		klog.Infof("Degraded Machine: %v and Degraded Reason: %v", m.Name, m.Annotations[constants.MachineConfigDaemonReasonAnnotationKey])
+		klog.Infof("Degraded Machine: %v and Degraded Reason: %v", m.Name, m.Annotations[daemonconsts.MachineConfigDaemonReasonAnnotationKey])
 	}
 	if degradedMachineCount > 0 {
 		nodeDegraded = true

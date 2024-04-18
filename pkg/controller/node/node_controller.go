@@ -193,9 +193,9 @@ func newController(
 	}
 
 	mosbInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    ctrl.addMachineConfigPool,
-		UpdateFunc: ctrl.updateMachineConfigPool,
-		DeleteFunc: ctrl.deleteMachineConfigPool,
+		AddFunc:    ctrl.addMachineOSBuild,
+		UpdateFunc: ctrl.updateMachineOSBuild,
+		DeleteFunc: ctrl.deleteMachineOSBuild,
 	})
 
 	mcpInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -289,7 +289,6 @@ func (ctrl *Controller) checkMasterNodesOnDelete(obj interface{}) {
 		klog.Error(err)
 		return
 	}
-	return
 }
 
 // checkMasterNodesonUpdate makes the master nodes schedulable/unschedulable whenever scheduler
@@ -820,7 +819,7 @@ func (ctrl *Controller) handleErr(err error, key interface{}) {
 // ready so we can update both the nodes' desired MachineConfig and desired
 // image annotations simultaneously.
 
-func (ctrl *Controller) GetConfigAndBuild(pool *mcfgv1.MachineConfigPool) (*mcfgv1alpha1.MachineOSConfig, *mcfgv1alpha1.MachineOSBuild, error) {
+func (ctrl *Controller) getConfigAndBuild(pool *mcfgv1.MachineConfigPool) (*mcfgv1alpha1.MachineOSConfig, *mcfgv1alpha1.MachineOSBuild, error) {
 	var ourConfig *mcfgv1alpha1.MachineOSConfig
 	var ourBuild *mcfgv1alpha1.MachineOSBuild
 	configList, err := ctrl.client.MachineconfigurationV1alpha1().MachineOSConfigs().List(context.TODO(), metav1.ListOptions{})
@@ -857,7 +856,7 @@ func (ctrl *Controller) GetConfigAndBuild(pool *mcfgv1.MachineConfigPool) (*mcfg
 
 func (ctrl *Controller) canLayeredPoolContinue(pool *mcfgv1.MachineConfigPool) (string, bool, error) {
 
-	mosc, mosb, _ := ctrl.GetConfigAndBuild(pool)
+	mosc, mosb, _ := ctrl.getConfigAndBuild(pool)
 
 	if mosc == nil || mosb == nil {
 		return "No MachineOSConfig or Build for this pool", false, nil
@@ -951,9 +950,10 @@ func (ctrl *Controller) syncMachineConfigPool(key string) error {
 		return ctrl.syncStatusOnly(pool)
 	}
 
-	mosc, mosb, _ := ctrl.GetConfigAndBuild(pool)
+	mosc, mosb, _ := ctrl.getConfigAndBuild(pool)
+	layered := ctrl.IsLayeredPool(pool, mosc, mosb)
 
-	if ok := ctrl.IsLayeredPool(pool, mosc, mosb); ok {
+	if layered {
 		reason, canApplyUpdates, err := ctrl.canLayeredPoolContinue(pool)
 		if err != nil {
 			klog.Infof("Layered pool %s encountered an error: %s", pool.Name, err)
@@ -1000,9 +1000,6 @@ func (ctrl *Controller) syncMachineConfigPool(key string) error {
 		hasInProgressTaint := checkIfNodeHasInProgressTaint(node)
 
 		lns := ctrlcommon.NewLayeredNodeState(node)
-		config, build, _ := ctrl.GetConfigAndBuild(pool)
-
-		layered := ctrl.IsLayeredPool(pool, config, build)
 		if lns.IsDesiredEqualToPool(pool, layered) {
 			if hasInProgressTaint {
 				if err := ctrl.removeUpdateInProgressTaint(ctx, node.Name); err != nil {
@@ -1020,12 +1017,7 @@ func (ctrl *Controller) syncMachineConfigPool(key string) error {
 		}
 	}
 
-	// NOTE
-	// this needs to get triggered, the new os img needs to propogate here and be set on the candidate machines.
-	config, build, _ := ctrl.GetConfigAndBuild(pool)
-
-	layered := ctrl.IsLayeredPool(pool, config, build)
-	candidates, capacity := getAllCandidateMachines(layered, config, build, pool, nodes, maxunavail)
+	candidates, capacity := getAllCandidateMachines(layered, mosc, mosb, pool, nodes, maxunavail)
 	if len(candidates) > 0 {
 		zones := make(map[string]bool)
 		for _, candidate := range candidates {
@@ -1110,8 +1102,6 @@ func (ctrl *Controller) setClusterConfigAnnotation(nodes []*corev1.Node) error {
 	return nil
 }
 
-// updateCandidateNode needs to understand MOSB
-// specifically, the LayeredNodeState probably needs to understand mosb
 func (ctrl *Controller) updateCandidateNode(mosc *mcfgv1alpha1.MachineOSConfig, mosb *mcfgv1alpha1.MachineOSBuild, nodeName string, pool *mcfgv1.MachineConfigPool) error {
 	return clientretry.RetryOnConflict(constants.NodeUpdateBackoff, func() error {
 		oldNode, err := ctrl.kubeClient.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
@@ -1125,6 +1115,7 @@ func (ctrl *Controller) updateCandidateNode(mosc *mcfgv1alpha1.MachineOSConfig, 
 
 		lns := ctrlcommon.NewLayeredNodeState(oldNode)
 		layered := ctrl.IsLayeredPool(pool, mosc, mosb)
+		// Not layered
 		if mosb == nil {
 			if lns.IsDesiredEqualToPool(pool, layered) {
 				// If the node's desired annotations match the pool, return directly without updating the node.
@@ -1133,7 +1124,7 @@ func (ctrl *Controller) updateCandidateNode(mosc *mcfgv1alpha1.MachineOSConfig, 
 
 			}
 			lns.SetDesiredStateFromPool(layered, pool)
-
+			// Layered
 		} else {
 			if lns.IsDesiredEqualToBuild(mosc, mosb) {
 				// If the node's desired annotations match the pool, return directly without updating the node.
@@ -1280,7 +1271,7 @@ func (ctrl *Controller) updateCandidateMachines(pool *mcfgv1.MachineConfigPool, 
 
 func (ctrl *Controller) setDesiredAnnotations(pool *mcfgv1.MachineConfigPool, candidates []*corev1.Node) error {
 	eventName := "SetDesiredConfig"
-	config, build, _ := ctrl.GetConfigAndBuild(pool)
+	config, build, _ := ctrl.getConfigAndBuild(pool)
 
 	if layered := ctrl.IsLayeredPool(pool, config, build); layered {
 		eventName = "SetDesiredConfigAndOSImage"
@@ -1291,7 +1282,7 @@ func (ctrl *Controller) setDesiredAnnotations(pool *mcfgv1.MachineConfigPool, ca
 	for _, node := range candidates {
 		//ctrl.logPool(pool, "Setting node %s target to %s", node.Name, getPoolUpdateLine(pool))
 		if err := ctrl.updateCandidateNode(config, build, node.Name, pool); err != nil {
-			return fmt.Errorf("setting desired %s for node %s: %w", &pool.Spec.Configuration.Name, node.Name, err)
+			return fmt.Errorf("setting desired %s for node %s: %w", pool.Spec.Configuration.Name, node.Name, err)
 		}
 	}
 
